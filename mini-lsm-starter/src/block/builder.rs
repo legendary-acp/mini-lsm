@@ -78,29 +78,6 @@ impl BlockBuilder {
 
         self.offsets.push(self.data.len() as u16);
         let overlap = compute_overlap(self.first_key.raw_ref(), key.raw_ref());
-
-        // DEBUG: Print what we're storing
-        println!(
-            "DEBUG ADD: key = {:?}",
-            String::from_utf8_lossy(key.raw_ref())
-        );
-        println!(
-            "DEBUG ADD: first_key = {:?}",
-            String::from_utf8_lossy(self.first_key.raw_ref())
-        );
-        println!("DEBUG ADD: overlap = {}", overlap);
-        println!(
-            "DEBUG ADD: key.len() = {}, suffix_len = {}",
-            key.len(),
-            key.len() - overlap
-        );
-        println!(
-            "DEBUG ADD: suffix = {:?}",
-            String::from_utf8_lossy(&key.raw_ref()[overlap..])
-        );
-        println!("DEBUG ADD: value = {:?}", String::from_utf8_lossy(value));
-        println!("---");
-
         self.data.put_u16(overlap as u16);
         self.data.put_u16((key.len() - overlap) as u16);
         self.data.put(&key.raw_ref()[overlap..]);
