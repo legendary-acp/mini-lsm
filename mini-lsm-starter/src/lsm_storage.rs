@@ -334,71 +334,59 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // 1) Snapshot and debug
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
-        }; // drop global lock here
-
-        // Search on the current memtable.
-        if let Some(value) = snapshot.memtable.get(key) {
-            if value.is_empty() {
-                // found tomestone, return key not exists
-                return Ok(None);
-            }
-            return Ok(Some(value));
-        }
-
-        // Search on immutable memtables.
-        for memtable in snapshot.imm_memtables.iter() {
-            if let Some(value) = memtable.get(key) {
-                if value.is_empty() {
-                    // found tomestone, return key not exists
-                    return Ok(None);
-                }
-                return Ok(Some(value));
-            }
-        }
-
-        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
-
-        let keep_table = |key: &[u8], table: &SsTable| {
-            if key_within(key, table.first_key().raw_ref(), table.last_key().raw_ref()) {
-                if let Some(bloom) = &table.bloom {
-                    if bloom.may_contain(farmhash::fingerprint32(key)) {
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
-            }
-            false
         };
 
-        for table in snapshot.l0_sstables.iter() {
-            let table = snapshot.sstables[table].clone();
-            if keep_table(key, &table) {
-                l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
-                    table,
-                    Key::from_slice(key),
-                )?));
+        if let Some(v) = snapshot.memtable.get(key) {
+            return Ok(if v.is_empty() { None } else { Some(v) });
+        }
+        // 3) Immutable memtables
+        for (i, mem) in snapshot.imm_memtables.iter().enumerate() {
+            if let Some(v) = mem.get(key) {
+                return Ok(if v.is_empty() { None } else { Some(v) });
             }
         }
-        let l0_iter = MergeIterator::create(l0_iters);
 
-        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
-        for table in snapshot.levels[0].1.iter() {
-            let table = snapshot.sstables[table].clone();
-            if keep_table(key, &table) {
-                l1_ssts.push(table);
+        // 4) Level-0 SSTs
+        for &id in &snapshot.l0_sstables {
+            let tbl = snapshot.sstables.get(&id).unwrap();
+            let start = tbl.first_key().raw_ref();
+            let end = tbl.last_key().raw_ref();
+            let it = SsTableIterator::create_and_seek_to_key(tbl.clone(), Key::from_slice(key))?;
+
+            if it.is_valid() && it.key() == Key::from_slice(key) {
+                let v = it.value();
+                return Ok(if v.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::copy_from_slice(v))
+                });
             }
         }
-        let l1_iter = SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?;
 
-        let iter = TwoMergeIterator::create(l0_iter, l1_iter)?;
+        // 5) All deeper levels (1…N), in reverse so the newest (bottom) level is checked first
+        for (_, sst_ids) in snapshot.levels.iter().rev() {
+            for &id in sst_ids {
+                let tbl = snapshot.sstables.get(&id).unwrap();
+                let start = tbl.first_key().raw_ref();
+                let end = tbl.last_key().raw_ref();
+                let it =
+                    SsTableIterator::create_and_seek_to_key(tbl.clone(), Key::from_slice(key))?;
 
-        if iter.is_valid() && iter.key() == Key::from_slice(key) && !iter.value().is_empty() {
-            return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                if it.is_valid() && it.key() == Key::from_slice(key) {
+                    let v = it.value();
+                    return Ok(if v.is_empty() {
+                        None
+                    } else {
+                        Some(Bytes::copy_from_slice(v))
+                    });
+                }
+            }
         }
+
         Ok(None)
     }
 
@@ -529,81 +517,95 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
+        // 1) Snapshot
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
-        }; // drop global lock here
-
-        let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
-        for memtable in snapshot.imm_memtables.iter() {
-            memtable_iters.push(Box::new(memtable.scan(lower, upper)));
-        }
-        let memtable_iter = MergeIterator::create(memtable_iters);
-
-        let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
-        for table_id in snapshot.l0_sstables.iter() {
-            let table = snapshot.sstables[table_id].clone();
-            if range_overlap(
-                lower,
-                upper,
-                table.first_key().raw_ref(),
-                table.last_key().raw_ref(),
-            ) {
-                let iter = match lower {
-                    Bound::Included(key) => {
-                        SsTableIterator::create_and_seek_to_key(table, Key::from_slice(key))?
-                    }
-                    Bound::Excluded(key) => {
-                        let mut iter =
-                            SsTableIterator::create_and_seek_to_key(table, Key::from_slice(key))?;
-                        if iter.is_valid() && iter.key() == Key::from_slice(key) {
-                            iter.next()?;
-                        }
-                        iter
-                    }
-                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
-                };
-
-                table_iters.push(Box::new(iter));
-            }
-        }
-
-        let l0_iter = MergeIterator::create(table_iters);
-
-        let mut l1_ssts = Vec::with_capacity(snapshot.levels[0].1.len());
-        for table in snapshot.levels[0].1.iter() {
-            let table = snapshot.sstables[table].clone();
-            if range_overlap(
-                lower,
-                upper,
-                table.first_key().raw_ref(),
-                table.last_key().raw_ref(),
-            ) {
-                l1_ssts.push(table);
-            }
-        }
-
-        let l1_iter = match lower {
-            Bound::Included(key) => {
-                SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?
-            }
-            Bound::Excluded(key) => {
-                let mut iter =
-                    SstConcatIterator::create_and_seek_to_key(l1_ssts, Key::from_slice(key))?;
-                if iter.is_valid() && iter.key() == Key::from_slice(key) {
-                    iter.next()?;
-                }
-                iter
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_ssts)?,
         };
 
-        let iter = TwoMergeIterator::create(memtable_iter, l0_iter)?;
-        let iter = TwoMergeIterator::create(iter, l1_iter)?;
+        // 2) Merge memtable + immutable memtables
+        let mut mem_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        mem_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
+        for imm in &snapshot.imm_memtables {
+            mem_iters.push(Box::new(imm.scan(lower, upper)));
+        }
+        let mem_iter = MergeIterator::create(mem_iters);
 
+        // 3) Merge Level-0 SSTs
+        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for &id in &snapshot.l0_sstables {
+            let tbl = snapshot.sstables.get(&id).unwrap().clone();
+            if range_overlap(
+                lower,
+                upper,
+                tbl.first_key().raw_ref(),
+                tbl.last_key().raw_ref(),
+            ) {
+                // seek according to `lower`
+                let it = match lower {
+                    Bound::Included(k) => {
+                        SsTableIterator::create_and_seek_to_key(tbl.clone(), Key::from_slice(k))?
+                    }
+                    Bound::Excluded(k) => {
+                        let mut it = SsTableIterator::create_and_seek_to_key(
+                            tbl.clone(),
+                            Key::from_slice(k),
+                        )?;
+                        if it.is_valid() && it.key() == Key::from_slice(k) {
+                            it.next()?;
+                        }
+                        it
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(tbl.clone())?,
+                };
+                l0_iters.push(Box::new(it));
+            }
+        }
+        let l0_iter = MergeIterator::create(l0_iters);
+
+        // 4) First timestamp-merge: memtables ↔ L0 SSTs
+        let mem_l0_iter = TwoMergeIterator::create(mem_iter, l0_iter)?;
+
+        // 5) Flatten *all* deeper levels (1…N)
+        let mut deep_tables = Vec::new();
+        for (_, ids) in &snapshot.levels {
+            for &id in ids {
+                let tbl = snapshot.sstables.get(&id).unwrap().clone();
+                if range_overlap(
+                    lower,
+                    upper,
+                    tbl.first_key().raw_ref(),
+                    tbl.last_key().raw_ref(),
+                ) {
+                    deep_tables.push(tbl);
+                }
+            }
+        }
+        // 5a) Sort by start‐key so concatenation walks key‐space properly
+        deep_tables.sort_by(|a, b| a.first_key().raw_ref().cmp(b.first_key().raw_ref()));
+
+        // 5b) Build & seek a single concatenated iterator over levels 1…N
+        let deep_iter = match lower {
+            Bound::Included(k) => {
+                SstConcatIterator::create_and_seek_to_key(deep_tables, Key::from_slice(k))?
+            }
+            Bound::Excluded(k) => {
+                let mut it =
+                    SstConcatIterator::create_and_seek_to_key(deep_tables, Key::from_slice(k))?;
+                if it.is_valid() && it.key() == Key::from_slice(k) {
+                    it.next()?;
+                }
+                it
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(deep_tables)?,
+        };
+
+        // 6) Second timestamp-merge: (mem+L0) ↔ (levels 1…N)
+        let full_iter = TwoMergeIterator::create(mem_l0_iter, deep_iter)?;
+
+        // 7) Wrap in your fused LsmIterator
         Ok(FusedIterator::new(LsmIterator::new(
-            iter,
+            full_iter,
             map_bound(upper),
         )?))
     }

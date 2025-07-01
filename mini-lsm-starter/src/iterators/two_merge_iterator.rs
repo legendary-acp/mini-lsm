@@ -43,7 +43,7 @@ impl<
     }
 
     fn skip_b(&mut self) -> Result<()> {
-        if self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
+        while self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
             self.b.next()?;
         }
         Ok(())
