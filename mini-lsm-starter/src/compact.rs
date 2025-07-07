@@ -379,7 +379,7 @@ impl LsmStorageInner {
             let path = self.path_of_sst(*file_to_remove);
 
             if let Err(e) = std::fs::remove_file(path) {
-                eprintln!("remove sstable failed: {}", e);
+                eprintln!("remove sstable failed: {e}");
             }
         }
 
@@ -400,7 +400,7 @@ impl LsmStorageInner {
                 loop {
                     crossbeam_channel::select! {
                         recv(ticker) -> _ => if let Err(e) = this.trigger_compaction() {
-                            eprintln!("compaction failed: {}", e);
+                            eprintln!("compaction failed: {e}");
                         },
                         recv(rx) -> _ => return
                     }
@@ -432,7 +432,7 @@ impl LsmStorageInner {
             loop {
                 crossbeam_channel::select! {
                     recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
-                        eprintln!("flush failed: {}", e);
+                        eprintln!("flush failed: {e}");
                     },
                     recv(rx) -> _ => return
                 }
